@@ -249,6 +249,8 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply({ content: "❌ End time must be after Start time.", ephemeral: true });
     }
 
+    await interaction.deferReply();
+
     db.run(
         `INSERT INTO ctfs (name, url, format, start, end, status, room_channel_id, flags_channel_id, role_id)
          VALUES (?, ?, ?, ?, ?, 'scheduled', NULL, NULL, NULL)`,
@@ -256,10 +258,8 @@ client.on("interactionCreate", async interaction => {
         async function(err) {
             if (err) {
                 console.error(err);
-                return interaction.reply({ content: "❌ Database Error.", ephemeral: true });
+                return interaction.editReply({ content: "❌ Database Error." });
             }
-
-            await interaction.deferReply();
 
             const annChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.ANNOUNCEMENTS);
 
@@ -278,7 +278,7 @@ client.on("interactionCreate", async interaction => {
                 await interaction.channel?.send({ content: "@everyone", embeds: [embed] });
             }
 
-            interaction.editReply(`✅ **${name}** Created & Announced!`);
+                        interaction.editReply(`✅ **${name}** Created & Announced!`);
         }
     );
   }
@@ -290,6 +290,9 @@ client.on("interactionCreate", async interaction => {
     }
 
     const ctfName = interaction.options.getString("name");
+    if (!ctfName) {
+        return interaction.reply({ content: "❌ CTF name is required. Update commands and run /end_ctf name:CTF_NAME", ephemeral: true });
+    }
 
     getCtfByName(ctfName, async (err, ctf) => {
         if (!ctf) return interaction.reply({ content: "CTF not found.", ephemeral: true });
@@ -359,6 +362,9 @@ client.on("interactionCreate", async interaction => {
       }
 
       const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "❌ CTF name is required. Update commands and run /allflags name:CTF_NAME", ephemeral: true });
+      }
 
       getCtfByName(ctfName, (err, ctf) => {
           if (!ctf) {
@@ -389,6 +395,9 @@ client.on("interactionCreate", async interaction => {
   /* ------------------ USER: JOIN (OTP GEN) ------------------ */
   if (commandName === "join_ctf") {
       const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "❌ CTF name is required. Update commands and run /join_ctf name:CTF_NAME", ephemeral: true });
+      }
 
       getCtfByName(ctfName, (err, ctf) => {
         if (!ctf || ctf.status === 'ended') {
@@ -476,6 +485,9 @@ client.on("interactionCreate", async interaction => {
   /* ------------------ USER: SUBMIT FLAG ------------------ */
   if (commandName === "flag") {
       const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "❌ CTF name is required. Update commands and run /flag name:CTF_NAME ...", ephemeral: true });
+      }
       getCtfByName(ctfName, (err, ctf) => {
           if (!ctf) return interaction.reply({ content: "CTF not found.", ephemeral: true });
           if (ctf.status === 'ended' || Date.now() > ctf.end) {
@@ -542,35 +554,41 @@ client.on("interactionCreate", async interaction => {
 
   /* ------------------ USER: SCOREBOARD ------------------ */
   if (commandName === "scoreboard") {
-            const ctfName = interaction.options.getString("name");
-            getCtfByName(ctfName, (err, ctf) => {
-                if (!ctf) return interaction.reply({ content: "CTF not found.", ephemeral: true });
+      const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "❌ CTF name is required. Update commands and run /scoreboard name:CTF_NAME", ephemeral: true });
+      }
+      getCtfByName(ctfName, (err, ctf) => {
+          if (!ctf) return interaction.reply({ content: "CTF not found.", ephemeral: true });
 
-                db.all(
-                    `SELECT user_id, COUNT(*) as score FROM flags_ctf WHERE ctf_event_id=? GROUP BY user_id ORDER BY score DESC LIMIT 15`,
-                        [ctf.id],
-                        (err, rows) => {
-            if (!rows || rows.length === 0) return interaction.reply("📉 No solves yet.");
+          db.all(
+              `SELECT user_id, COUNT(*) as score FROM flags_ctf WHERE ctf_event_id=? GROUP BY user_id ORDER BY score DESC LIMIT 15`,
+              [ctf.id],
+              (err, rows) => {
+                  if (!rows || rows.length === 0) return interaction.reply("📉 No solves yet.");
 
-            let desc = "";
-            rows.forEach((r, i) => {
-                desc += `**${i+1}.** <@${r.user_id}> : \`${r.score}\` 🚩\n`;
-            });
+                  let desc = "";
+                  rows.forEach((r, i) => {
+                      desc += `**${i+1}.** <@${r.user_id}> : \`${r.score}\` 🚩\n`;
+                  });
 
-            const embed = new EmbedBuilder()
-                .setTitle("🏆 Live Scoreboard")
-                .setColor(Colors.Purple)
-                .setDescription(desc)
-                .setTimestamp();
-            
-            interaction.reply({ embeds: [embed] });
-        });
+                  const embed = new EmbedBuilder()
+                      .setTitle("🏆 Live Scoreboard")
+                      .setColor(Colors.Purple)
+                      .setDescription(desc)
+                      .setTimestamp();
+                  
+                  interaction.reply({ embeds: [embed] });
+              });
       });
   }
 
   /* ------------------ USER: TIMELEFT ------------------ */
   if (commandName === "timeleft") {
       const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "❌ CTF name is required. Update commands and run /timeleft name:CTF_NAME", ephemeral: true });
+      }
       getCtfByName(ctfName, (err, ctf) => {
           if (!ctf) return interaction.reply("CTF not found.");
 
