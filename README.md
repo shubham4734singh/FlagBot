@@ -10,7 +10,7 @@
 - **Node.js** (v16.9.0 or higher)
 - **Discord Bot Token** (from [Discord Developer Portal](https://discord.com/developers/applications))
 - **Bot Permissions**:
-  - `Manage Roles` (to assign CTF_PLAYER role)
+  - `Manage Roles` (to assign per-CTF roles)
   - `Manage Channels` (to create private CTF rooms)
   - `Send Messages`
   - `Use Slash Commands`
@@ -46,7 +46,8 @@ Creates a new CTF event, announces it, and opens registration.
 `/create_ctf name:HackTheBox start_datetime:2026-03-01T09:00:00 end_datetime:2026-03-03T09:00:00`
 
 ### `/end_ctf`
-Manually ends the current CTF.
+Manually ends a specific CTF.
+- **name**: The exact CTF name used in `/create_ctf`.
 - Sets status to "ended".
 - Prevents new flag submissions.
 - Publishes the **Final Results** to `#ctf-announcements`.
@@ -55,6 +56,7 @@ Manually ends the current CTF.
 (Hidden) Lists **all submitted flags** so far.
 - Only visible to the Admin (Ephemeral).
 - Shows: User | Challenge | Flag
+- **name**: The exact CTF name used in `/create_ctf`.
 
 ---
 
@@ -62,22 +64,24 @@ Manually ends the current CTF.
 
 ### 1. Joining (`/join_ctf`)
 Players must join to participate.
+- **name**: The exact CTF name used in `/create_ctf`.
 - Bot sends a **One-Time Password (OTP)** (visible only to them).
 - Bot instructs them to verify.
 
 ### 2. Verifying (`/verify_otp`)
 - **code**: The 6-digit code received from `/join_ctf`.
 - **Success**:
-  - User gets `CTF_PLAYER` role.
-  - User gains access to private channels: `#ctf-room` & `#ctf-flags`.
+  - User gets a per-CTF role.
+  - User gains access to private channels for that CTF.
 
 ### 3. Submitting Flags (`/flag`)
+- **name**: The exact CTF name used in `/create_ctf`.
 - **submission**: Enter the full submission string.
 - **Strict Format Required**:
   You must use the format: `==Challenge Name== ==Category== ==Flag==`
   
   **Example**:
-  `/flag submission: ==Web 101== ==Web Security== ==CTF{my_secret_flag}==`
+  `/flag name:BITSCTF 2026 submission: ==Web 101== ==Web Security== ==CTF{my_secret_flag}==`
 
 - **Rules**:
   - The format must be exact.
@@ -85,8 +89,8 @@ Players must join to participate.
   - Flags are logged to `#ctf-flags`.
 
 ### 4. Stats (`/scoreboard`, `/timeleft`)
-- **`/scoreboard`**: Shows the Top 15 players.
-- **`/timeleft`**: Shows time remaining until CTF ends.
+- **`/scoreboard`**: Shows the Top 15 players (requires **name**).
+- **`/timeleft`**: Shows time remaining until CTF ends (requires **name**).
 
 ---
 
@@ -95,8 +99,29 @@ Players must join to participate.
 | Channel | Visibility | Purpose |
 | :--- | :--- | :--- |
 | **#ctf-announcements** | Public | Bot posts CTF announcements and final results here. |
-| **#ctf-room** | **Private** | Chat room for verified players only. |
-| **#ctf-flags** | **Private** | Read-only log of who solved what challenge. |
+| **#ctf-<ctf-name>** | **Private** | Chat room for verified players of that CTF only. |
+| **#ctf-<ctf-name>-flags** | **Private** | Read-only log of who solved what challenge for that CTF. |
+
+**Notes**:
+- No channels are created when you run `/create_ctf`.
+- Channels are created only after a player verifies with `/verify_otp` for that CTF.
+- If `#ctf-announcements` does not exist, the bot announces in the channel where `/create_ctf` was used.
+
+---
+
+## ✅ Multi-CTF Flow (A and B at the same time)
+
+**Admin**
+1. `/create_ctf name:CTF A start_datetime:2026-02-20T11:00:00 end_datetime:2026-02-22T11:00:00 official_url:https://example.com format:Jeopardy`
+2. `/create_ctf name:CTF B start_datetime:2026-02-25T11:00:00 end_datetime:2026-02-26T11:00:00 official_url:https://example.com format:Jeopardy`
+
+**Player**
+1. `/join_ctf name:CTF A`
+2. `/verify_otp code:123456`
+3. `/join_ctf name:CTF B`
+4. `/verify_otp code:654321`
+
+Each CTF has its own private channels, flags, and scoreboard.
 
 ---
 

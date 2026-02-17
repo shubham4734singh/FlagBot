@@ -24,16 +24,22 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("end_ctf")
-    .setDescription("Force end current CTF and publish results (Admin Only)"),
+    .setDescription("Force end a CTF and publish results (Admin Only)")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("allflags")
-    .setDescription("View all submitted flags (Admin Only)"),
+    .setDescription("View all submitted flags (Admin Only)")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true)),
 
   /* --- USER COMMANDS --- */
   new SlashCommandBuilder()
     .setName("join_ctf")
-    .setDescription("Start the join process (Sends OTP)"),
+    .setDescription("Start the join process (Sends OTP)")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("verify_otp")
@@ -45,17 +51,25 @@ const commands = [
     .setName("flag")
     .setDescription("Submit flag (Format: ==Challenge== ==Category== ==Flag==)")
     .addStringOption(option => 
+      option.setName("name")
+      .setDescription("CTF Name")
+      .setRequired(true))
+    .addStringOption(option => 
       option.setName("submission")
       .setDescription("e.g. ==Login Bypass== ==Web== ==CTF{flag}==")
       .setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("scoreboard")
-    .setDescription("View live scoreboard"),
+    .setDescription("View live scoreboard")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("timeleft")
     .setDescription("Check CTF schedule status")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true))
 ]
 .map(command => command.toJSON());
 
