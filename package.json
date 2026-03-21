@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "deploy-commands": "node deploy-commands.js",
+    "bot": "node index.js",
+    "start": "node deploy-commands.js && node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -13,6 +15,6 @@
   "dependencies": {
     "discord.js": "^14.25.1",
     "dotenv": "^17.2.4",
-    "sqlite3": "^5.1.7"
+    "mongodb": "^6.16.0"
   }
 }

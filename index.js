@@ -6,14 +6,15 @@ const {
   EmbedBuilder, 
   Colors, 
   ChannelType,
-  MessageFlags,
   Events
 } = require("discord.js");
-const sqlite3 = require("sqlite3").verbose();
+const { MongoClient } = require("mongodb");
 const crypto = require("crypto");
 
 /* ================= CONFIGURATION ================= */
 const ADMIN_ID = process.env.ADMIN_ID || "843351441664901121"; 
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "flagbot";
 const ROLE_PREFIX = "CTF";
 const CHANNELS = {
     ANNOUNCEMENTS: "ctf-announcements"
@@ -30,60 +31,383 @@ const client = new Client({
 });
 
 /* ================= DATABASE SETUP ================= */
-const db = new sqlite3.Database("ctf.db");
+let mongoClient;
+let collections;
 
-function initDB() {
-  db.serialize(() => {
-        // CTF Events (multiple active)
-        db.run(`CREATE TABLE IF NOT EXISTS ctfs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            url TEXT,
-            format TEXT,
-            start INTEGER,
-            end INTEGER,
-            status TEXT,
-            room_channel_id TEXT,
-            flags_channel_id TEXT,
-            role_id TEXT
-        )`);
-
-        // Backward-compatible columns (ignore errors if they already exist)
-        db.run("ALTER TABLE ctfs ADD COLUMN room_channel_id TEXT", () => {});
-        db.run("ALTER TABLE ctfs ADD COLUMN flags_channel_id TEXT", () => {});
-        db.run("ALTER TABLE ctfs ADD COLUMN role_id TEXT", () => {});
-
-        // Joined Users per CTF
-        db.run(`CREATE TABLE IF NOT EXISTS joined_ctf (
-            user_id TEXT,
-            ctf_id INTEGER,
-            joined_at INTEGER,
-            PRIMARY KEY (user_id, ctf_id)
-        )`);
-
-        // Flag Submissions (unique per CTF)
-        db.run(`CREATE TABLE IF NOT EXISTS flags_ctf (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            challenge TEXT,
-            category TEXT,
-            flag TEXT,
-            timestamp INTEGER,
-            ctf_event_id INTEGER,
-            UNIQUE (flag, ctf_event_id)
-        )`);
-
-        // OTP System per CTF
-        db.run(`CREATE TABLE IF NOT EXISTS otp_ctf (
-            user_id TEXT,
-            ctf_id INTEGER,
-            code TEXT,
-            expires_at INTEGER,
-            PRIMARY KEY (user_id, ctf_id)
-        )`);
-  });
+function normalizeSql(sql) {
+    return sql.replace(/\s+/g, " ").trim();
 }
-initDB();
+
+function invokeRunCallback(callback, err, context = {}) {
+    if (typeof callback === "function") {
+        queueMicrotask(() => callback.call(context, err || null));
+    } else if (err) {
+        console.error(err);
+    }
+}
+
+function invokeDataCallback(callback, err, data) {
+    if (typeof callback === "function") {
+        queueMicrotask(() => callback(err || null, data));
+    } else if (err) {
+        console.error(err);
+    }
+}
+
+function resolveArgs(params, callback) {
+    if (typeof params === "function") {
+        return { params: [], callback: params };
+    }
+
+    return { params: params || [], callback };
+}
+
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isDuplicateKeyError(error) {
+    return Boolean(error && (error.code === 11000 || error.code === 11001));
+}
+
+function logDbError(context, error) {
+    console.error(`[${context}]`, error);
+}
+
+async function getNextSequence(name) {
+    const counterResult = await collections.counters.findOneAndUpdate(
+        { _id: name },
+        { $inc: { seq: 1 } },
+        { upsert: true, returnDocument: "after" }
+    );
+    const counterDoc = counterResult?.value || counterResult;
+    return counterDoc.seq;
+}
+
+function createDbAdapter() {
+    return {
+        serialize(callback) {
+            if (typeof callback === "function") {
+                callback();
+            }
+        },
+
+        run(sql, params, callback) {
+            const args = resolveArgs(params, callback);
+            const normalized = normalizeSql(sql);
+
+            (async () => {
+                const context = {};
+
+                if (
+                    normalized.startsWith("CREATE TABLE IF NOT EXISTS") ||
+                    normalized.startsWith("ALTER TABLE ctfs ADD COLUMN")
+                ) {
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized.startsWith("INSERT INTO ctfs ")) {
+                    const [name, url, format, start, end] = args.params;
+                    const id = await getNextSequence("ctfs");
+                    await collections.ctfs.insertOne({
+                        id,
+                        name,
+                        url,
+                        format,
+                        start,
+                        end,
+                        status: "scheduled",
+                        room_channel_id: null,
+                        flags_channel_id: null,
+                        role_id: null
+                    });
+                    context.lastID = id;
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "INSERT OR REPLACE INTO joined_ctf (user_id, ctf_id, joined_at) VALUES (?, ?, ?)") {
+                    const [userId, ctfId, joinedAt] = args.params;
+                    await collections.joined_ctf.updateOne(
+                        { user_id: userId, ctf_id: ctfId },
+                        { $set: { user_id: userId, ctf_id: ctfId, joined_at: joinedAt } },
+                        { upsert: true }
+                    );
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "DELETE FROM otp_ctf WHERE user_id=? AND ctf_id=?") {
+                    const [userId, ctfId] = args.params;
+                    await collections.otp_ctf.deleteMany({ user_id: userId, ctf_id: ctfId });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "UPDATE ctfs SET room_channel_id=?, flags_channel_id=?, role_id=? WHERE id=?") {
+                    const [roomChannelId, flagsChannelId, roleId, id] = args.params;
+                    await collections.ctfs.updateOne(
+                        { id },
+                        { $set: { room_channel_id: roomChannelId, flags_channel_id: flagsChannelId, role_id: roleId } }
+                    );
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "UPDATE ctfs SET status='ended' WHERE id=?") {
+                    const [id] = args.params;
+                    await collections.ctfs.updateOne({ id }, { $set: { status: "ended" } });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "UPDATE ctfs SET flags_channel_id=? WHERE id=?") {
+                    const [flagsChannelId, id] = args.params;
+                    await collections.ctfs.updateOne({ id }, { $set: { flags_channel_id: flagsChannelId } });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "DELETE FROM otp_ctf WHERE ctf_id=?") {
+                    const [ctfId] = args.params;
+                    await collections.otp_ctf.deleteMany({ ctf_id: ctfId });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "DELETE FROM joined_ctf WHERE ctf_id=?") {
+                    const [ctfId] = args.params;
+                    await collections.joined_ctf.deleteMany({ ctf_id: ctfId });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "DELETE FROM flags_ctf WHERE ctf_event_id=?") {
+                    const [ctfId] = args.params;
+                    await collections.flags_ctf.deleteMany({ ctf_event_id: ctfId });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "DELETE FROM ctfs WHERE id=?") {
+                    const [id] = args.params;
+                    await collections.ctfs.deleteOne({ id });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "UPDATE ctfs SET url=?, format=?, start=?, end=? WHERE id=?") {
+                    const [url, format, start, end, id] = args.params;
+                    await collections.ctfs.updateOne(
+                        { id },
+                        { $set: { url, format, start, end } }
+                    );
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "INSERT OR REPLACE INTO otp_ctf (user_id, ctf_id, code, expires_at) VALUES (?, ?, ?, ?)") {
+                    const [userId, ctfId, code, expiresAt] = args.params;
+                    await collections.otp_ctf.updateOne(
+                        { user_id: userId, ctf_id: ctfId },
+                        { $set: { user_id: userId, ctf_id: ctfId, code, expires_at: expiresAt } },
+                        { upsert: true }
+                    );
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "DELETE FROM joined_ctf WHERE user_id=? AND ctf_id=?") {
+                    const [userId, ctfId] = args.params;
+                    await collections.joined_ctf.deleteOne({ user_id: userId, ctf_id: ctfId });
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                if (normalized === "INSERT INTO flags_ctf (user_id, challenge, category, flag, timestamp, ctf_event_id) VALUES (?, ?, ?, ?, ?, ?)") {
+                    const [userId, challenge, category, flag, timestamp, ctfEventId] = args.params;
+                    const id = await getNextSequence("flags_ctf");
+                    await collections.flags_ctf.insertOne({
+                        id,
+                        user_id: userId,
+                        challenge,
+                        category,
+                        flag,
+                        timestamp,
+                        ctf_event_id: ctfEventId
+                    });
+                    context.lastID = id;
+                    return invokeRunCallback(args.callback, null, context);
+                }
+
+                throw new Error(`Unsupported db.run SQL: ${normalized}`);
+            })().catch((error) => invokeRunCallback(args.callback, error));
+        },
+
+        get(sql, params, callback) {
+            const args = resolveArgs(params, callback);
+            const normalized = normalizeSql(sql);
+
+            (async () => {
+                if (normalized === "SELECT * FROM ctfs WHERE lower(name)=lower(?) ORDER BY id DESC LIMIT 1") {
+                    const [name] = args.params;
+                    const row = await collections.ctfs.find({
+                        name: { $regex: `^${escapeRegExp(name)}$`, $options: "i" }
+                    }).sort({ id: -1 }).limit(1).next();
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                if (normalized === "SELECT * FROM ctfs WHERE id=?") {
+                    const [id] = args.params;
+                    const row = await collections.ctfs.findOne({ id });
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                if (normalized === "SELECT * FROM ctfs WHERE room_channel_id=? OR flags_channel_id=? ORDER BY id DESC LIMIT 1") {
+                    const [roomChannelId, flagsChannelId] = args.params;
+                    const row = await collections.ctfs.find({
+                        $or: [
+                            { room_channel_id: roomChannelId },
+                            { flags_channel_id: flagsChannelId }
+                        ]
+                    }).sort({ id: -1 }).limit(1).next();
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                if (normalized === "SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?") {
+                    const [userId, ctfId] = args.params;
+                    const row = await collections.joined_ctf.findOne({ user_id: userId, ctf_id: ctfId });
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                if (normalized === "SELECT COUNT(DISTINCT user_id) as count FROM flags_ctf WHERE ctf_event_id=?") {
+                    const [ctfId] = args.params;
+                    const users = await collections.flags_ctf.distinct("user_id", { ctf_event_id: ctfId });
+                    return invokeDataCallback(args.callback, null, { count: users.length });
+                }
+
+                if (normalized === "SELECT COUNT(*) as count FROM flags_ctf WHERE ctf_event_id=?") {
+                    const [ctfId] = args.params;
+                    const count = await collections.flags_ctf.countDocuments({ ctf_event_id: ctfId });
+                    return invokeDataCallback(args.callback, null, { count });
+                }
+
+                if (normalized === "SELECT * FROM otp_ctf WHERE user_id=? AND ctf_id=? AND code=?") {
+                    const [userId, ctfId, code] = args.params;
+                    const row = await collections.otp_ctf.findOne({ user_id: userId, ctf_id: ctfId, code });
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                if (normalized === "SELECT * FROM otp_ctf WHERE user_id=? AND code=? ORDER BY expires_at DESC LIMIT 1") {
+                    const [userId, code] = args.params;
+                    const row = await collections.otp_ctf.find({ user_id: userId, code }).sort({ expires_at: -1 }).limit(1).next();
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                if (normalized === "SELECT * FROM flags_ctf WHERE flag=? AND ctf_event_id=?") {
+                    const [flag, ctfId] = args.params;
+                    const row = await collections.flags_ctf.findOne({ flag, ctf_event_id: ctfId });
+                    return invokeDataCallback(args.callback, null, row || undefined);
+                }
+
+                throw new Error(`Unsupported db.get SQL: ${normalized}`);
+            })().catch((error) => invokeDataCallback(args.callback, error));
+        },
+
+        all(sql, params, callback) {
+            const args = resolveArgs(params, callback);
+            const normalized = normalizeSql(sql);
+
+            (async () => {
+                if (normalized === "SELECT * FROM flags_ctf WHERE ctf_event_id=? ORDER BY timestamp ASC") {
+                    const [ctfId] = args.params;
+                    const rows = await collections.flags_ctf.find({ ctf_event_id: ctfId }).sort({ timestamp: 1 }).toArray();
+                    return invokeDataCallback(args.callback, null, rows);
+                }
+
+                if (normalized === "SELECT user_id, COUNT(*) as score FROM flags_ctf WHERE ctf_event_id=? GROUP BY user_id ORDER BY score DESC, MIN(timestamp) ASC LIMIT 10") {
+                    const [ctfId] = args.params;
+                    const rows = await collections.flags_ctf.aggregate([
+                        { $match: { ctf_event_id: ctfId } },
+                        {
+                            $group: {
+                                _id: "$user_id",
+                                score: { $sum: 1 },
+                                firstSolve: { $min: "$timestamp" }
+                            }
+                        },
+                        { $sort: { score: -1, firstSolve: 1 } },
+                        { $limit: 10 },
+                        { $project: { _id: 0, user_id: "$_id", score: 1 } }
+                    ]).toArray();
+                    return invokeDataCallback(args.callback, null, rows);
+                }
+
+                if (normalized === "SELECT * FROM ctfs WHERE status != 'ended' AND end <= ?") {
+                    const [now] = args.params;
+                    const rows = await collections.ctfs.find({
+                        status: { $ne: "ended" },
+                        end: { $lte: now }
+                    }).sort({ end: 1 }).toArray();
+                    return invokeDataCallback(args.callback, null, rows);
+                }
+
+                if (normalized === "SELECT * FROM flags_ctf WHERE ctf_event_id=? ORDER BY timestamp DESC") {
+                    const [ctfId] = args.params;
+                    const rows = await collections.flags_ctf.find({ ctf_event_id: ctfId }).sort({ timestamp: -1 }).toArray();
+                    return invokeDataCallback(args.callback, null, rows);
+                }
+
+                if (normalized === "SELECT * FROM ctfs WHERE status != 'ended' ORDER BY start ASC") {
+                    const rows = await collections.ctfs.find({ status: { $ne: "ended" } }).sort({ start: 1 }).toArray();
+                    return invokeDataCallback(args.callback, null, rows);
+                }
+
+                if (normalized === "SELECT user_id, COUNT(*) as score FROM flags_ctf WHERE ctf_event_id=? GROUP BY user_id ORDER BY score DESC LIMIT 15") {
+                    const [ctfId] = args.params;
+                    const rows = await collections.flags_ctf.aggregate([
+                        { $match: { ctf_event_id: ctfId } },
+                        {
+                            $group: {
+                                _id: "$user_id",
+                                score: { $sum: 1 },
+                                firstSolve: { $min: "$timestamp" }
+                            }
+                        },
+                        { $sort: { score: -1, firstSolve: 1 } },
+                        { $limit: 15 },
+                        { $project: { _id: 0, user_id: "$_id", score: 1 } }
+                    ]).toArray();
+                    return invokeDataCallback(args.callback, null, rows);
+                }
+
+                throw new Error(`Unsupported db.all SQL: ${normalized}`);
+            })().catch((error) => invokeDataCallback(args.callback, error));
+        }
+    };
+}
+
+async function initDB() {
+    if (!MONGODB_URI) {
+        throw new Error("Missing MONGODB_URI in environment variables.");
+    }
+
+    mongoClient = new MongoClient(MONGODB_URI, {
+        family: 4,
+        serverSelectionTimeoutMS: 10000
+    });
+    await mongoClient.connect();
+
+    const database = mongoClient.db(MONGODB_DB_NAME);
+    collections = {
+        ctfs: database.collection("ctfs"),
+        joined_ctf: database.collection("joined_ctf"),
+        flags_ctf: database.collection("flags_ctf"),
+        otp_ctf: database.collection("otp_ctf"),
+        counters: database.collection("counters")
+    };
+
+    await Promise.all([
+        collections.ctfs.createIndex({ id: 1 }, { unique: true }),
+        collections.ctfs.createIndex({ status: 1, end: 1 }),
+        collections.ctfs.createIndex({ room_channel_id: 1 }),
+        collections.ctfs.createIndex({ flags_channel_id: 1 }),
+        collections.joined_ctf.createIndex({ user_id: 1, ctf_id: 1 }, { unique: true }),
+        collections.flags_ctf.createIndex({ flag: 1, ctf_event_id: 1 }, { unique: true }),
+        collections.flags_ctf.createIndex({ ctf_event_id: 1, timestamp: 1 }),
+        collections.otp_ctf.createIndex({ user_id: 1, ctf_id: 1 }, { unique: true }),
+        collections.otp_ctf.createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 })
+    ]);
+}
+
+const db = createDbAdapter();
 
 /* ================= HELPERS ================= */
 
@@ -502,6 +826,19 @@ client.on("interactionCreate", async interaction => {
     await interaction.deferReply();
     await ensureAnnouncementsChannel(interaction.guild);
 
+    const existingCtf = await new Promise((resolve) => {
+        getCtfByName(name, (lookupErr, row) => {
+            if (lookupErr) {
+                logDbError("create_ctf.lookup", lookupErr);
+            }
+            resolve(row || null);
+        });
+    });
+
+    if (existingCtf && existingCtf.status !== "ended") {
+        return interaction.editReply({ content: `A CTF named **${name}** already exists and is not ended yet.` });
+    }
+
     db.run(
         `INSERT INTO ctfs (name, url, format, start, end, status, room_channel_id, flags_channel_id, role_id)
          VALUES (?, ?, ?, ?, ?, 'scheduled', NULL, NULL, NULL)`,
@@ -703,11 +1040,21 @@ client.on("interactionCreate", async interaction => {
       }
 
       getCtfByName(ctfName, (err, ctf) => {
+        if (err) {
+            logDbError("join_ctf.lookup", err);
+            return interaction.reply({ content: "Failed to load this CTF.", ephemeral: true });
+        }
+
         if (!ctf || ctf.status === 'ended') {
              return interaction.reply({ content: "🚫 CTF not found or already ended.", ephemeral: true });
         }
 
         db.get("SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id], (err, row) => {
+            if (err) {
+                logDbError("join_ctf.joined_lookup", err);
+                return interaction.reply({ content: "Failed to check your registration status.", ephemeral: true });
+            }
+
             if (row) {
                 return interaction.reply({ content: "✅ You have already joined!", ephemeral: true });
             }
@@ -719,7 +1066,10 @@ client.on("interactionCreate", async interaction => {
               "INSERT OR REPLACE INTO otp_ctf (user_id, ctf_id, code, expires_at) VALUES (?, ?, ?, ?)",
               [interaction.user.id, ctf.id, otp, expires],
               (err) => {
-                  if (err) console.error(err);
+                  if (err) {
+                      logDbError("join_ctf.otp_upsert", err);
+                      return interaction.reply({ content: "Failed to create your OTP. Please try again.", ephemeral: true });
+                  }
                   
                   const msg = `🏆 **${ctf.name}**\n🔐 **Verification Required**\nYour OTP is: \`${otp}\``;
                   
@@ -742,7 +1092,7 @@ client.on("interactionCreate", async interaction => {
         [],
         (err, rows) => {
             if (err) {
-                console.error(err);
+                logDbError("create_ctf.insert", err);
                 return interaction.reply({ content: "Failed to load CTF list.", ephemeral: true });
             }
 
@@ -823,6 +1173,11 @@ client.on("interactionCreate", async interaction => {
 
       if (ctfName) {
           return getCtfByName(ctfName, (err, ctf) => {
+              if (err) {
+                  logDbError("verify_otp.lookup_by_name", err);
+                  return interaction.editReply({ content: "Failed to load this CTF." });
+              }
+
               if (!ctf || ctf.status === "ended") {
                   return interaction.editReply({ content: "CTF not found or already ended." });
               }
@@ -831,6 +1186,11 @@ client.on("interactionCreate", async interaction => {
                 "SELECT * FROM otp_ctf WHERE user_id=? AND ctf_id=? AND code=?",
                 [interaction.user.id, ctf.id, code.trim()],
                 (err, otpRow) => {
+                    if (err) {
+                        logDbError("verify_otp.lookup_exact", err);
+                        return interaction.editReply({ content: "Failed to verify this OTP." });
+                    }
+
                     if (!otpRow) {
                         return interaction.editReply({ content: "Invalid OTP for this CTF. Run `/join_ctf` again." });
                     }
@@ -850,6 +1210,11 @@ client.on("interactionCreate", async interaction => {
         "SELECT * FROM otp_ctf WHERE user_id=? AND code=? ORDER BY expires_at DESC LIMIT 1",
         [interaction.user.id, code.trim()],
         (err, otpRow) => {
+            if (err) {
+                logDbError("verify_otp.lookup_latest", err);
+                return interaction.editReply({ content: "Failed to verify this OTP." });
+            }
+
             if (!otpRow) {
                 return interaction.editReply({ content: "No OTP found for this code. Run `/join_ctf` again." });
             }
@@ -860,6 +1225,11 @@ client.on("interactionCreate", async interaction => {
             }
 
             return getCtfById(otpRow.ctf_id, (ctfErr, ctf) => {
+                if (ctfErr) {
+                    logDbError("verify_otp.lookup_by_id", ctfErr);
+                    return interaction.editReply({ content: "Failed to load this CTF." });
+                }
+
                 if (!ctf || ctf.status === "ended") {
                     return interaction.editReply({ content: "CTF not found or already ended." });
                 }
@@ -874,6 +1244,14 @@ client.on("interactionCreate", async interaction => {
   if (commandName === "flag") {
       const ctfName = interaction.options.getString("name");
       resolveCtfForInteraction(interaction, ctfName, (err, ctf) => {
+          if (err) {
+              logDbError("flag.resolve_ctf", err);
+              return interaction.reply({
+                  content: "Failed to load this CTF. Please try again.",
+                  ephemeral: true
+              });
+          }
+
           if (!ctf) {
               return interaction.reply({
                   content: "CTF not found. Use this command inside the CTF room or provide the CTF name.",
@@ -914,19 +1292,36 @@ client.on("interactionCreate", async interaction => {
 
           // Check if joined
           db.get("SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id], (err, joined) => {
+              if (err) {
+                  logDbError("flag.joined_lookup", err);
+                  return interaction.reply({ content: "Failed to verify your participation.", ephemeral: true });
+              }
+
               if (!joined) {
                   return interaction.reply({ content: "❌ You must `/join_ctf` & verify first.", ephemeral: true });
               }
 
               // Check Duplicate
               db.get("SELECT * FROM flags_ctf WHERE flag=? AND ctf_event_id=?", [flag, ctf.id], (err, exists) => {
+                  if (err) {
+                      logDbError("flag.duplicate_lookup", err);
+                      return interaction.reply({ content: "Failed to validate this submission.", ephemeral: true });
+                  }
+
                   if (exists) return interaction.reply({ content: "❌ Flag already submitted (by someone).", ephemeral: true });
 
                                     const eventId = ctf.id;
                   db.run("INSERT INTO flags_ctf (user_id, challenge, category, flag, timestamp, ctf_event_id) VALUES (?, ?, ?, ?, ?, ?)",
                     [interaction.user.id, challenge, category, flag, Date.now(), eventId],
                     async (err) => {
-                        if (err) return interaction.reply({ content: "❌ Database Error (Unique constraint?).", ephemeral: true });
+                        if (err) {
+                            if (isDuplicateKeyError(err)) {
+                                return interaction.reply({ content: "❌ Flag already submitted (by someone).", ephemeral: true });
+                            }
+
+                            logDbError("flag.insert", err);
+                            return interaction.reply({ content: "❌ Database Error while saving your flag.", ephemeral: true });
+                        }
 
                         interaction.reply({ content: `✅ Correct! Flag accepted for **${challenge}**.`, ephemeral: true });
                     });
@@ -939,6 +1334,14 @@ client.on("interactionCreate", async interaction => {
   if (commandName === "scoreboard") {
       const ctfName = interaction.options.getString("name");
       resolveCtfForInteraction(interaction, ctfName, (err, ctf) => {
+          if (err) {
+              logDbError("scoreboard.resolve_ctf", err);
+              return interaction.reply({
+                  content: "Failed to load this CTF. Please try again.",
+                  ephemeral: true
+              });
+          }
+
           if (!ctf) {
               return interaction.reply({
                   content: "CTF not found. Use this command inside the CTF room or provide the CTF name.",
@@ -950,7 +1353,12 @@ client.on("interactionCreate", async interaction => {
               `SELECT user_id, COUNT(*) as score FROM flags_ctf WHERE ctf_event_id=? GROUP BY user_id ORDER BY score DESC LIMIT 15`,
               [ctf.id],
               (err, rows) => {
-                  if (!rows || rows.length === 0) return interaction.reply("📉 No solves yet.");
+                  if (err) {
+                      logDbError("scoreboard.list", err);
+                      return interaction.reply({ content: "Failed to load the scoreboard.", ephemeral: true });
+                  }
+
+                  if (!rows || rows.length === 0) return interaction.reply({ content: "📉 No solves yet.", ephemeral: true });
 
                   let desc = "";
                   rows.forEach((r, i) => {
@@ -1026,4 +1434,15 @@ client.on("interactionCreate", async interaction => {
 });
 
 /* ================= LOGIN ================= */
-client.login(process.env.TOKEN);
+async function startBot() {
+    try {
+        await initDB();
+        await client.login(process.env.TOKEN);
+    } catch (error) {
+        console.error("Failed to start bot:", error);
+        console.error("Atlas connection tips: confirm the cluster is active, your current public IP is allowed in Atlas Network Access, and outbound access to port 27017 is not blocked.");
+        process.exit(1);
+    }
+}
+
+startBot();

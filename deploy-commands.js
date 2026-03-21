@@ -65,7 +65,7 @@ const commands = [
     .setName("verify_otp")
     .setDescription("Verify your OTP to join the CTF")
     .addStringOption(option => 
-      option.setName("name").setDescription("CTF Name").setRequired(true))
+      option.setName("name").setDescription("CTF Name").setRequired(false))
     .addStringOption(option => 
       option.setName("code").setDescription("6-digit OTP code").setRequired(true)),
 
@@ -73,13 +73,13 @@ const commands = [
     .setName("flag")
     .setDescription("Submit flag in your private CTF room")
     .addStringOption(option => 
-      option.setName("name")
-      .setDescription("CTF Name")
-      .setRequired(false))
-    .addStringOption(option => 
       option.setName("submission")
       .setDescription("e.g. ==Login Bypass== ==Web== ==CTF{flag}==")
-      .setRequired(true)),
+      .setRequired(true))
+    .addStringOption(option => 
+      option.setName("name")
+      .setDescription("CTF Name")
+      .setRequired(false)),
 
   new SlashCommandBuilder()
     .setName("list_ctf")
