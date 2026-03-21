@@ -75,7 +75,7 @@ const commands = [
     .addStringOption(option => 
       option.setName("name")
       .setDescription("CTF Name")
-      .setRequired(true))
+      .setRequired(false))
     .addStringOption(option => 
       option.setName("submission")
       .setDescription("e.g. ==Login Bypass== ==Web== ==CTF{flag}==")
@@ -95,13 +95,17 @@ const commands = [
     .setName("scoreboard")
     .setDescription("View live scoreboard")
     .addStringOption(option => 
-      option.setName("name").setDescription("CTF Name").setRequired(true)),
+      option.setName("name").setDescription("CTF Name").setRequired(false)),
 
   new SlashCommandBuilder()
     .setName("timeleft")
     .setDescription("Check CTF schedule status")
     .addStringOption(option => 
-      option.setName("name").setDescription("CTF Name").setRequired(true))
+      option.setName("name").setDescription("CTF Name").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("ctf_help")
+    .setDescription("View all FlagBot commands and how to use them")
 ]
 .map(command => command.toJSON());
 
