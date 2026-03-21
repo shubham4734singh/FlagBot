@@ -117,21 +117,22 @@ async function getOrCreateCtfRole(guild, ctfName, storedRoleId) {
 }
 
 function sanitizeChannelSlug(name) {
-    const base = name
+    const parts = (name || "")
         .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .replace(/-+/g, "-");
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .split("_")
+        .filter(Boolean)
+        .filter(part => part !== "ctf");
 
-    if (!base) return "ctf";
-    return base.startsWith("ctf") ? base : `ctf-${base}`;
+    return parts.join("_") || "event";
 }
 
 function getCtfChannelNames(ctfName) {
     const base = sanitizeChannelSlug(ctfName);
     return {
-        room: base,
-        flags: `${base}-flags`
+        room: `ctf_${base}`,
+        flags: `ctf_${base}_flags`
     };
 }
 
@@ -216,11 +217,132 @@ function getCtfByName(name, callback) {
     );
 }
 
+function buildFinalResultsEmbed(ctf, rows, solverCount, flagCount) {
+    const medals = ["🥇", "🥈", "🥉"];
+    let desc = "";
+
+    if (!rows || rows.length === 0) {
+        desc = "No solves recorded.";
+    } else {
+        rows.forEach((row, index) => {
+            const prefix = medals[index] || `**${index + 1}.**`;
+            desc += `${prefix} <@${row.user_id}> — **${row.score} flags**\n`;
+        });
+    }
+
+    return new EmbedBuilder()
+        .setTitle(`🏁 CTF ENDED: ${ctf.name}`)
+        .setColor(Colors.Gold)
+        .setDescription(desc)
+        .addFields(
+            { name: "Stats", value: `👥 Solvers: ${solverCount || 0}\n🚩 Total Flags: ${flagCount || 0}` }
+        )
+        .setTimestamp();
+}
+
+async function finalizeCtf(ctf, guild) {
+    const eventId = ctf.id;
+
+    const run = (sql, params = []) => new Promise((resolve, reject) => {
+        db.run(sql, params, function(err) {
+            if (err) reject(err);
+            else resolve(this);
+        });
+    });
+
+    const all = (sql, params = []) => new Promise((resolve, reject) => {
+        db.all(sql, params, (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+
+    const get = (sql, params = []) => new Promise((resolve, reject) => {
+        db.get(sql, params, (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+        });
+    });
+
+    await run("UPDATE ctfs SET status='ended' WHERE id=?", [eventId]);
+
+    const rows = await all(
+        `SELECT user_id, COUNT(*) as score
+         FROM flags_ctf
+         WHERE ctf_event_id=?
+         GROUP BY user_id
+         ORDER BY score DESC, MIN(timestamp) ASC
+         LIMIT 10`,
+        [eventId]
+    );
+
+    const solverRow = await get(
+        "SELECT COUNT(DISTINCT user_id) as count FROM flags_ctf WHERE ctf_event_id=?",
+        [eventId]
+    );
+    const flagRow = await get(
+        "SELECT COUNT(*) as count FROM flags_ctf WHERE ctf_event_id=?",
+        [eventId]
+    );
+
+    const embed = buildFinalResultsEmbed(ctf, rows, solverRow?.count, flagRow?.count);
+
+    const announcementChannel = guild.channels.cache.find(c => c.name === CHANNELS.ANNOUNCEMENTS);
+    if (announcementChannel) {
+        await announcementChannel.send({ embeds: [embed] });
+    }
+
+    const roomChannel = ctf.room_channel_id ? guild.channels.cache.get(ctf.room_channel_id) : null;
+    if (roomChannel) {
+        await roomChannel.send({ embeds: [embed] });
+        if (ctf.role_id) {
+            await roomChannel.permissionOverwrites.edit(ctf.role_id, {
+                ViewChannel: true,
+                SendMessages: false,
+                AddReactions: true
+            });
+        }
+    }
+
+    const flagsChannel = ctf.flags_channel_id ? guild.channels.cache.get(ctf.flags_channel_id) : null;
+    if (flagsChannel && ctf.role_id) {
+        await flagsChannel.permissionOverwrites.edit(ctf.role_id, {
+            ViewChannel: true,
+            SendMessages: false,
+            AddReactions: true
+        });
+    }
+}
+
+async function autoFinalizeExpiredCtfs() {
+    const guild = client.guilds.cache.first();
+    if (!guild) return;
+
+    db.all(
+        "SELECT * FROM ctfs WHERE status != 'ended' AND end <= ?",
+        [Date.now()],
+        async (err, rows) => {
+            if (err || !rows || rows.length === 0) return;
+
+            for (const ctf of rows) {
+                try {
+                    await finalizeCtf(ctf, guild);
+                } catch (error) {
+                    console.error("Auto finalize failed:", ctf.name, error);
+                }
+            }
+        }
+    );
+}
+
 /* ================= INTERACTION HANDLER ================= */
 
 client.once(Events.ClientReady, () => {
     console.log(`✅ ${client.user.tag} Online & Ready.`);
 });
+
+autoFinalizeExpiredCtfs();
+setInterval(autoFinalizeExpiredCtfs, 60 * 1000);
 
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
@@ -250,6 +372,7 @@ client.on("interactionCreate", async interaction => {
     }
 
     await interaction.deferReply();
+    await ensureAnnouncementsChannel(interaction.guild);
 
     db.run(
         `INSERT INTO ctfs (name, url, format, start, end, status, room_channel_id, flags_channel_id, role_id)
@@ -296,6 +419,15 @@ client.on("interactionCreate", async interaction => {
 
     getCtfByName(ctfName, async (err, ctf) => {
         if (!ctf) return interaction.reply({ content: "CTF not found.", ephemeral: true });
+        await interaction.deferReply();
+
+        try {
+            await finalizeCtf(ctf, interaction.guild);
+            return interaction.editReply("CTF ended. Results published to the event room and announcements.");
+        } catch (error) {
+            console.error(error);
+            return interaction.editReply("Failed to finalize this CTF.");
+        }
 
         const eventId = ctf.id;
         db.run("UPDATE ctfs SET status='ended' WHERE id=?", [ctf.id]);
@@ -334,6 +466,13 @@ client.on("interactionCreate", async interaction => {
                       const resultsChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.ANNOUNCEMENTS);
                       if (resultsChannel) {
                           await resultsChannel.send({ embeds: [embed] });
+                      }
+
+                      const roomChannel = ctf.room_channel_id
+                          ? interaction.guild.channels.cache.get(ctf.room_channel_id)
+                          : null;
+                      if (roomChannel) {
+                          await roomChannel.send({ embeds: [embed] });
                       }
 
                       const flagsChannel = ctf.flags_channel_id
@@ -421,7 +560,7 @@ client.on("interactionCreate", async interaction => {
                   const msg = `🏆 **${ctf.name}**\n🔐 **Verification Required**\nYour OTP is: \`${otp}\``;
                   
                   interaction.reply({ 
-                      content: `${msg}\n\nRun command: \`/verify_otp code:${otp}\`\n(Valid for 5 minutes)`,
+                      content: `${msg}\n\nRun command: \`/verify_otp name:${ctf.name} code:${otp}\`\n(Valid for 5 minutes)`,
                       ephemeral: true 
                   });
               }
@@ -430,10 +569,143 @@ client.on("interactionCreate", async interaction => {
       });
   }
 
+  /* ------------------ USER: LIST CTF ------------------ */
+  if (commandName === "list_ctf") {
+      const now = Date.now();
+
+      return db.all(
+        "SELECT * FROM ctfs WHERE status != 'ended' ORDER BY start ASC",
+        [],
+        (err, rows) => {
+            if (err) {
+                console.error(err);
+                return interaction.reply({ content: "Failed to load CTF list.", ephemeral: true });
+            }
+
+            if (!rows || rows.length === 0) {
+                return interaction.reply({ content: "No active or upcoming CTF events found.", ephemeral: true });
+            }
+
+            const desc = rows.map((ctf, index) => {
+                let status = "Upcoming";
+                if (now >= ctf.start && now <= ctf.end) status = "Live";
+                if (now > ctf.end) status = "Ending soon";
+
+                return [
+                    `**${index + 1}. ${ctf.name}**`,
+                    `Status: ${status}`,
+                    `Start: <t:${Math.floor(ctf.start / 1000)}:F>`,
+                    `End: <t:${Math.floor(ctf.end / 1000)}:F>`,
+                    `Format: ${ctf.format || "Unknown"}`,
+                    `Join with: \`/join_ctf name:${ctf.name}\``
+                ].join("\n");
+            }).join("\n\n");
+
+            const embed = new EmbedBuilder()
+                .setTitle("Available CTF Events")
+                .setColor(Colors.Blue)
+                .setDescription(desc)
+                .setTimestamp();
+
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+      );
+  }
+
+  /* ------------------ USER: LEAVE CTF ------------------ */
+  if (commandName === "leave_ctf") {
+      const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "CTF name is required.", ephemeral: true });
+      }
+
+      return getCtfByName(ctfName, (err, ctf) => {
+          if (!ctf) {
+              return interaction.reply({ content: "CTF not found.", ephemeral: true });
+          }
+
+          db.get("SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id], async (err, joinedRow) => {
+              if (!joinedRow) {
+                  return interaction.reply({ content: "You are not part of this CTF.", ephemeral: true });
+              }
+
+              db.run("DELETE FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id]);
+              db.run("DELETE FROM otp_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id]);
+
+              try {
+                  if (ctf.role_id) {
+                      const member = await interaction.guild.members.fetch(interaction.user.id);
+                      await member.roles.remove(ctf.role_id).catch(() => {});
+                  }
+
+                  const roomMention = ctf.room_channel_id ? `<#${ctf.room_channel_id}>` : `**${ctf.name}**`;
+                  return interaction.reply({
+                      content: `You left **${ctf.name}**. Your access to ${roomMention} has been removed.`,
+                      ephemeral: true
+                  });
+              } catch (error) {
+                  console.error(error);
+                  return interaction.reply({ content: "You were removed from the CTF, but role cleanup failed.", ephemeral: true });
+              }
+          });
+      });
+  }
+
   /* ------------------ USER: VERIFY OTP ------------------ */
   if (commandName === "verify_otp") {
       await interaction.deferReply({ ephemeral: true }); // Prevent timeout
+      const ctfName = interaction.options.getString("name");
       const code = interaction.options.getString("code");
+
+      return getCtfByName(ctfName, (err, ctf) => {
+          if (!ctf || ctf.status === "ended") {
+              return interaction.editReply({ content: "CTF not found or already ended." });
+          }
+
+          db.get(
+            "SELECT * FROM otp_ctf WHERE user_id=? AND ctf_id=? AND code=?",
+            [interaction.user.id, ctf.id, code.trim()],
+            (err, otpRow) => {
+                if (!otpRow) {
+                    return interaction.editReply({ content: "Invalid OTP for this CTF. Run `/join_ctf` again." });
+                }
+
+                if (Date.now() > otpRow.expires_at) {
+                    db.run("DELETE FROM otp_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, otpRow.ctf_id]);
+                    return interaction.editReply({ content: "OTP expired. Run `/join_ctf` again." });
+                }
+
+                db.get("SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id], async (err, joinedRow) => {
+                    if (joinedRow) {
+                        return interaction.editReply({ content: "You are already a player." });
+                    }
+
+                    db.run(
+                      "INSERT OR REPLACE INTO joined_ctf (user_id, ctf_id, joined_at) VALUES (?, ?, ?)",
+                      [interaction.user.id, ctf.id, Date.now()]
+                    );
+                    db.run("DELETE FROM otp_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id]);
+
+                    try {
+                        const role = await getOrCreateCtfRole(interaction.guild, ctf.name, ctf.role_id);
+                        const member = await interaction.guild.members.fetch(interaction.user.id);
+                        await member.roles.add(role);
+
+                        const { roomChannel, flagsChannel } = await ensureCtfChannels(interaction.guild, role, ctf.name, ctf);
+                        db.run(
+                          "UPDATE ctfs SET room_channel_id=?, flags_channel_id=?, role_id=? WHERE id=?",
+                          [roomChannel?.id || null, flagsChannel?.id || null, role?.id || null, ctf.id]
+                        );
+
+                        interaction.editReply({ content: `Verification successful. You joined **${ctf.name}**.\nRoom: <#${roomChannel.id}>` });
+                    } catch (e) {
+                        console.error(e);
+                        interaction.editReply({ content: "Joined database, but failed to assign role or channels. Check bot permissions." });
+                    }
+                });
+            }
+          );
+      });
 
       db.get("SELECT * FROM otp_ctf WHERE user_id=? AND code=?", [interaction.user.id, code.trim()], (err, otpRow) => {
           if (!otpRow) return interaction.editReply({ content: "❌ No OTP found. Run `/join_ctf` first." });
@@ -510,6 +782,17 @@ client.on("interactionCreate", async interaction => {
           const challenge = parts[0].replace(/==/g, "").trim();
           const category = parts[1].replace(/==/g, "").trim();
           const flag = parts[2].replace(/==/g, "").trim();
+
+          if (!ctf.room_channel_id) {
+              return interaction.reply({ content: "Private room is not ready yet. Join and verify this CTF first.", ephemeral: true });
+          }
+
+          if (interaction.channelId !== ctf.room_channel_id) {
+              return interaction.reply({
+                  content: `Submit flags only inside <#${ctf.room_channel_id}> for **${ctf.name}**.`,
+                  ephemeral: true
+              });
+          }
 
           // Check if joined
           db.get("SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id], (err, joined) => {

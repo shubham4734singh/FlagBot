@@ -45,11 +45,13 @@ const commands = [
     .setName("verify_otp")
     .setDescription("Verify your OTP to join the CTF")
     .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true))
+    .addStringOption(option => 
       option.setName("code").setDescription("6-digit OTP code").setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("flag")
-    .setDescription("Submit flag (Format: ==Challenge== ==Category== ==Flag==)")
+    .setDescription("Submit flag in your private CTF room")
     .addStringOption(option => 
       option.setName("name")
       .setDescription("CTF Name")
@@ -58,6 +60,16 @@ const commands = [
       option.setName("submission")
       .setDescription("e.g. ==Login Bypass== ==Web== ==CTF{flag}==")
       .setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("list_ctf")
+    .setDescription("View all active and upcoming CTF events"),
+
+  new SlashCommandBuilder()
+    .setName("leave_ctf")
+    .setDescription("Leave a CTF event and remove room access")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("scoreboard")
