@@ -23,6 +23,20 @@ const commands = [
         option.setName("format").setDescription("Jeopardy/Attack-Defense").setRequired(false)),
 
   new SlashCommandBuilder()
+    .setName("edit_ctf")
+    .setDescription("Edit an existing CTF Event (Admin Only)")
+    .addStringOption(option =>
+      option.setName("name").setDescription("Existing CTF Name").setRequired(true))
+    .addStringOption(option =>
+      option.setName("start_datetime").setDescription("New start (YYYY-MM-DD HH:MM) or ISO").setRequired(false))
+    .addStringOption(option =>
+      option.setName("end_datetime").setDescription("New end (YYYY-MM-DD HH:MM) or ISO").setRequired(false))
+    .addStringOption(option =>
+      option.setName("official_url").setDescription("New CTF Website URL").setRequired(false))
+    .addStringOption(option =>
+      option.setName("format").setDescription("New format").setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName("end_ctf")
     .setDescription("Force end a CTF and publish results (Admin Only)")
     .addStringOption(option => 
@@ -31,6 +45,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName("allflags")
     .setDescription("View all submitted flags (Admin Only)")
+    .addStringOption(option => 
+      option.setName("name").setDescription("CTF Name").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("delete_ctf")
+    .setDescription("Delete a CTF event and its saved data (Admin Only)")
     .addStringOption(option => 
       option.setName("name").setDescription("CTF Name").setRequired(true)),
 

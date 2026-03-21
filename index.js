@@ -217,6 +217,17 @@ function getCtfByName(name, callback) {
     );
 }
 
+function buildCtfAnnouncementEmbed(ctf, titlePrefix = "📢 CTF Announcement") {
+    return new EmbedBuilder()
+        .setTitle(`${titlePrefix} – ${ctf.name}`)
+        .setColor(Colors.Blue)
+        .setDescription(`------------------------------------------------------------------\n🔹 **Format**: ${ctf.format}\n🔹 **Official URL**: ${ctf.url}\n\n🕒 **Schedule**:\n📆 Start: <t:${Math.floor(ctf.start/1000)}:F> (<t:${Math.floor(ctf.start/1000)}:R>)\n📆 End: <t:${Math.floor(ctf.end/1000)}:F> (<t:${Math.floor(ctf.end/1000)}:R>)\n------------------------------------------------------------------`)
+        .addFields(
+            { name: "Join Team", value: `🔗 [Click here to join team](${ctf.url})` }
+        )
+        .setFooter({ text: "Use /join_ctf to access bot channels." });
+}
+
 function buildFinalResultsEmbed(ctf, rows, solverCount, flagCount) {
     const medals = ["🥇", "🥈", "🥉"];
     let desc = "";
@@ -314,6 +325,34 @@ async function finalizeCtf(ctf, guild) {
     }
 }
 
+async function deleteCtfData(ctf, guild) {
+    const run = (sql, params = []) => new Promise((resolve, reject) => {
+        db.run(sql, params, function(err) {
+            if (err) reject(err);
+            else resolve(this);
+        });
+    });
+
+    const roomChannel = ctf.room_channel_id ? guild.channels.cache.get(ctf.room_channel_id) : null;
+    const flagsChannel = ctf.flags_channel_id ? guild.channels.cache.get(ctf.flags_channel_id) : null;
+    const role = ctf.role_id ? guild.roles.cache.get(ctf.role_id) : null;
+
+    if (roomChannel) {
+        await roomChannel.delete("CTF deleted by admin").catch(() => {});
+    }
+    if (flagsChannel) {
+        await flagsChannel.delete("CTF deleted by admin").catch(() => {});
+    }
+    if (role) {
+        await role.delete("CTF deleted by admin").catch(() => {});
+    }
+
+    await run("DELETE FROM otp_ctf WHERE ctf_id=?", [ctf.id]);
+    await run("DELETE FROM joined_ctf WHERE ctf_id=?", [ctf.id]);
+    await run("DELETE FROM flags_ctf WHERE ctf_event_id=?", [ctf.id]);
+    await run("DELETE FROM ctfs WHERE id=?", [ctf.id]);
+}
+
 async function autoFinalizeExpiredCtfs() {
     const guild = client.guilds.cache.first();
     if (!guild) return;
@@ -339,10 +378,9 @@ async function autoFinalizeExpiredCtfs() {
 
 client.once(Events.ClientReady, () => {
     console.log(`✅ ${client.user.tag} Online & Ready.`);
+    autoFinalizeExpiredCtfs();
+    setInterval(autoFinalizeExpiredCtfs, 60 * 1000);
 });
-
-autoFinalizeExpiredCtfs();
-setInterval(autoFinalizeExpiredCtfs, 60 * 1000);
 
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
@@ -386,14 +424,13 @@ client.on("interactionCreate", async interaction => {
 
             const annChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.ANNOUNCEMENTS);
 
-            const embed = new EmbedBuilder()
-                .setTitle(`📢 CTF Announcement – ${name}`)
-                .setColor(Colors.Blue)
-                .setDescription(`------------------------------------------------------------------\n🔹 **Format**: ${format}\n🔹 **Official URL**: ${url}\n\n🕒 **Schedule**:\n📆 Start: <t:${Math.floor(start/1000)}:F> (<t:${Math.floor(start/1000)}:R>)\n📆 End: <t:${Math.floor(end/1000)}:F> (<t:${Math.floor(end/1000)}:R>)\n------------------------------------------------------------------`)
-                .addFields(
-                    { name: "Join Team", value: `🔗 [Click here to join team](${url})` }
-                )
-                .setFooter({ text: "Make sure to join now! Use /join_ctf to access bot channels." });
+            const embed = buildCtfAnnouncementEmbed({
+                name,
+                format,
+                url,
+                start,
+                end
+            });
 
             if (annChannel) {
                 await annChannel.send({ content: "@everyone", embeds: [embed] });
@@ -404,6 +441,78 @@ client.on("interactionCreate", async interaction => {
                         interaction.editReply(`✅ **${name}** Created & Announced!`);
         }
     );
+  }
+
+  /* ------------------ CTF ADMIN: EDIT ------------------ */
+  if (commandName === "edit_ctf") {
+    if (interaction.user.id !== ADMIN_ID) {
+        return interaction.reply({ content: "⛔ Admin only.", ephemeral: true });
+    }
+
+    const ctfName = interaction.options.getString("name");
+    const startStr = interaction.options.getString("start_datetime");
+    const endStr = interaction.options.getString("end_datetime");
+    const newUrl = interaction.options.getString("official_url");
+    const newFormat = interaction.options.getString("format");
+
+    if (!startStr && !endStr && !newUrl && !newFormat) {
+        return interaction.reply({ content: "Provide at least one field to update.", ephemeral: true });
+    }
+
+    return getCtfByName(ctfName, async (err, ctf) => {
+        if (!ctf) {
+            return interaction.reply({ content: "CTF not found.", ephemeral: true });
+        }
+
+        const nextStart = startStr ? parseDate(startStr) : ctf.start;
+        const nextEnd = endStr ? parseDate(endStr) : ctf.end;
+
+        if ((startStr && !nextStart) || (endStr && !nextEnd)) {
+            return interaction.reply({ content: "Invalid date format. Use ISO 8601 like 2026-02-09T10:00:00", ephemeral: true });
+        }
+
+        if (nextEnd <= nextStart) {
+            return interaction.reply({ content: "End time must be after start time.", ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        const updated = {
+            ...ctf,
+            start: nextStart,
+            end: nextEnd,
+            url: newUrl || ctf.url,
+            format: newFormat || ctf.format
+        };
+
+        db.run(
+            "UPDATE ctfs SET url=?, format=?, start=?, end=? WHERE id=?",
+            [updated.url, updated.format, updated.start, updated.end, ctf.id],
+            async (updateErr) => {
+                if (updateErr) {
+                    console.error(updateErr);
+                    return interaction.editReply({ content: "Failed to update this CTF." });
+                }
+
+                try {
+                    await ensureAnnouncementsChannel(interaction.guild);
+                    const annChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.ANNOUNCEMENTS);
+                    const embed = buildCtfAnnouncementEmbed(updated, "🛠️ CTF Updated");
+
+                    if (annChannel) {
+                        await annChannel.send({ embeds: [embed] });
+                    } else {
+                        await interaction.channel?.send({ embeds: [embed] });
+                    }
+
+                    return interaction.editReply({ content: `Updated **${ctf.name}** successfully.` });
+                } catch (postErr) {
+                    console.error(postErr);
+                    return interaction.editReply({ content: `Updated **${ctf.name}**, but failed to post the update announcement.` });
+                }
+            }
+        );
+    });
   }
 
   /* ------------------ CTF ADMIN: END ------------------ */
@@ -428,70 +537,35 @@ client.on("interactionCreate", async interaction => {
             console.error(error);
             return interaction.editReply("Failed to finalize this CTF.");
         }
-
-        const eventId = ctf.id;
-        db.run("UPDATE ctfs SET status='ended' WHERE id=?", [ctf.id]);
-        await interaction.deferReply();
-
-        // Generate Final Scoreboard
-        db.all(
-          `SELECT user_id, COUNT(*) as score FROM flags_ctf WHERE ctf_event_id=? GROUP BY user_id ORDER BY score DESC, timestamp ASC LIMIT 10`,
-          [eventId],
-          async (err, rows) => {
-              let desc = "";
-              let medals = ["🥇", "🥈", "🥉"];
-
-              if (rows.length === 0) desc = "No solves recorded.";
-              else {
-                  rows.forEach((r, i) => {
-                      let prefix = medals[i] || `**${i+1}.**`;
-                      desc += `${prefix} <@${r.user_id}> — **${r.score} flags**\n`;
-                  });
-              }
-
-              // Count total solvers and flags for this CTF
-              db.get("SELECT COUNT(DISTINCT user_id) as count FROM flags_ctf WHERE ctf_event_id=?", [eventId], async (e, rJ) => {
-                  db.get("SELECT COUNT(*) as count FROM flags_ctf WHERE ctf_event_id=?", [eventId], async (e, rF) => {
-
-                      const embed = new EmbedBuilder()
-                          .setTitle(`🏁 CTF ENDED: ${ctf.name}`)
-                          .setColor(Colors.Gold)
-                          .setDescription(desc)
-                          .addFields(
-                              { name: "Stats", value: `👥 Solvers: ${rJ?.count || 0}\n🚩 Total Flags: ${rF?.count || 0}` }
-                          )
-                          .setTimestamp();
-
-                      // Send to Announcements instead of Results
-                      const resultsChannel = interaction.guild.channels.cache.find(c => c.name === CHANNELS.ANNOUNCEMENTS);
-                      if (resultsChannel) {
-                          await resultsChannel.send({ embeds: [embed] });
-                      }
-
-                      const roomChannel = ctf.room_channel_id
-                          ? interaction.guild.channels.cache.get(ctf.room_channel_id)
-                          : null;
-                      if (roomChannel) {
-                          await roomChannel.send({ embeds: [embed] });
-                      }
-
-                      const flagsChannel = ctf.flags_channel_id
-                          ? interaction.guild.channels.cache.get(ctf.flags_channel_id)
-                          : null;
-                      if (flagsChannel && ctf.role_id) {
-                          await flagsChannel.permissionOverwrites.edit(ctf.role_id, {
-                              ViewChannel: true,
-                              SendMessages: false,
-                              AddReactions: true
-                          });
-                      }
-
-                      interaction.editReply("✅ CTF Ended. Results published to Announcements.");
-                  });
-              });
-          }
-        );
     });
+  }
+
+  /* ------------------ CTF ADMIN: DELETE ------------------ */
+  if (commandName === "delete_ctf") {
+      if (interaction.user.id !== ADMIN_ID) {
+          return interaction.reply({ content: "⛔ Admin only.", ephemeral: true });
+      }
+
+      const ctfName = interaction.options.getString("name");
+      if (!ctfName) {
+          return interaction.reply({ content: "CTF name is required.", ephemeral: true });
+      }
+
+      return getCtfByName(ctfName, async (err, ctf) => {
+          if (!ctf) {
+              return interaction.reply({ content: "CTF not found.", ephemeral: true });
+          }
+
+          await interaction.deferReply({ ephemeral: true });
+
+          try {
+              await deleteCtfData(ctf, interaction.guild);
+              return interaction.editReply(`Deleted **${ctf.name}** from the database and removed its bot-managed channels/role if they existed.`);
+          } catch (error) {
+              console.error(error);
+              return interaction.editReply("Failed to delete this CTF.");
+          }
+      });
   }
 
   /* ------------------ CTF ADMIN: ALL FLAGS ------------------ */
@@ -705,52 +779,6 @@ client.on("interactionCreate", async interaction => {
                 });
             }
           );
-      });
-
-      db.get("SELECT * FROM otp_ctf WHERE user_id=? AND code=?", [interaction.user.id, code.trim()], (err, otpRow) => {
-          if (!otpRow) return interaction.editReply({ content: "❌ No OTP found. Run `/join_ctf` first." });
-
-          if (Date.now() > otpRow.expires_at) {
-              db.run("DELETE FROM otp_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, otpRow.ctf_id]);
-              return interaction.editReply({ content: "❌ OTP Expired. Run `/join_ctf` again." });
-          }
-
-          db.get("SELECT * FROM ctfs WHERE id=?", [otpRow.ctf_id], async (err, ctf) => {
-              if (!ctf || ctf.status === 'ended') {
-                  return interaction.editReply({ content: "🚫 CTF not found or already ended." });
-              }
-
-              db.get("SELECT * FROM joined_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id], async (err, joinedRow) => {
-                  if (joinedRow) {
-                      return interaction.editReply({ content: "✅ You are already a player." });
-                  }
-
-                  // OTP Valid -> Join
-                  db.run(
-                    "INSERT OR REPLACE INTO joined_ctf (user_id, ctf_id, joined_at) VALUES (?, ?, ?)",
-                    [interaction.user.id, ctf.id, Date.now()]
-                  );
-                  db.run("DELETE FROM otp_ctf WHERE user_id=? AND ctf_id=?", [interaction.user.id, ctf.id]);
-
-                  try {
-                      const role = await getOrCreateCtfRole(interaction.guild, ctf.name, ctf.role_id);
-                      const member = await interaction.guild.members.fetch(interaction.user.id);
-                      await member.roles.add(role);
-
-                      const storedIds = ctf;
-                      const { roomChannel, flagsChannel } = await ensureCtfChannels(interaction.guild, role, ctf.name, storedIds);
-                      db.run(
-                        "UPDATE ctfs SET room_channel_id=?, flags_channel_id=?, role_id=? WHERE id=?",
-                        [roomChannel?.id || null, flagsChannel?.id || null, role?.id || null, ctf.id]
-                      );
-
-                      interaction.editReply({ content: "🎉 **Verification Successful!** You have joined the CTF. Access granted." });
-                  } catch (e) {
-                      console.error(e);
-                      interaction.editReply({ content: "⚠ Joined database, but failed to assign Role/Channels. Check bot perms." });
-                  }
-              });
-          });
       });
   }
 
